@@ -1,0 +1,251 @@
+# bot.py
+# Полностью рабочий бот для автоматической торговли
+# Принимает: BUY → LONG, CLOSE → закрыть
+# Логи: bot.log
+
+import logging
+import sys
+
+# === Настройка логирования (сразу при запуске) ===
+log_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+log_file = "bot.log"
+
+# Очистка старых обработчиков
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# Лог в файл
+file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[file_handler])
+
+# Лог в консоль
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+logging.getLogger().addHandler(console_handler)
+
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("🚀 Запуск бота...")
+
+# === 🔐 ТВОИ ДАННЫЕ ===
+TELEGRAM_TOKEN = "8067433865:AAEEew7ehXxoFKG3ref_suf1vjfd4lRnvQo"
+AUTHORIZED_CHAT_ID = 5203579568  # Только ты
+
+BINANCE_API_KEY = "V6iumjWj1jYafSD7H8p6eDt8jeur7mpxi5kmsOj7ptkMtsuvr1g0hjvqr2i9gxKJ"
+BINANCE_API_SECRET = "ITt48AGOXSDMFsyrXYoT0jdnMcosW7oOBBa6pLDjgw3mIkUqM8RN3K24AiQZs88C"
+
+# === 🛠 Настройки сделки ===
+SYMBOL = "BTCUSDT"
+LEVERAGE = 5
+RISK_PERCENT = 95  # 95% от баланса
+
+# === 🔌 Подключение к Binance ===
+try:
+    from binance import Client
+    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    logger.info("✅ Подключено к Binance API")
+except Exception as e:
+    logger.critical(f"❌ Ошибка Binance: {e}")
+    print("❌ Ошибка Binance. Смотри bot.log")
+    sys.exit(1)
+
+# === 🔌 Подключение к Telegram ===
+try:
+    from telegram import Update
+    from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+    logger.info("✅ Импортированы модули Telegram")
+except Exception as e:
+    logger.critical(f"❌ Ошибка Telegram: {e}")
+    print("❌ Ошибка Telegram. Смотри bot.log")
+    sys.exit(1)
+
+# === Обработка сообщений ===
+def handle_message(update: Update, context: CallbackContext):
+    try:
+        chat_id = update.effective_chat.id
+        text = update.message.text.strip().upper()
+        logger.info(f"📩 Получено: '{text}' от chat_id={chat_id}")
+
+        if chat_id != AUTHORIZED_CHAT_ID:
+            logger.warning(f"🚫 Доступ запрещён: {chat_id}")
+            update.message.reply_text("❌ Доступ запрещён.")
+            return
+
+        if text == "BUY":
+            open_long(update)
+        elif text == "CLOSE":
+            close_position(update)
+        else:
+            update.message.reply_text("❌ Неизвестная команда. Используй: BUY или CLOSE")
+            logger.warning(f"⚠️ Неизвестная команда: {text}")
+
+    except Exception as e:
+        logger.error(f"🔴 Ошибка: {e}")
+
+# === Открытие LONG ===
+def open_long(update: Update):
+    try:
+        update.message.reply_text("🔄 Выполняю: BUY BTCUSDT (LONG)")
+
+        # Устанавливаем плечо
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        logger.info(f"⚙️ Плечо установлено: x{LEVERAGE}")
+
+        # Получаем аккаунт
+        try:
+            account = client.futures_account()
+        except Exception as e:
+            update.message.reply_text("❌ Ошибка получения аккаунта Binance")
+            logger.error(f"❌ futures_account() ошибка: {e}")
+            return
+
+        # Ищем USDT и получаем баланс (учитываем walletBalance)
+        usdt_balance = 0.0
+        for asset in account['assets']:
+            if asset['asset'] == 'USDT':
+                # Пробуем сначала 'balance', потом 'walletBalance'
+                bal = asset.get('balance')
+                w_bal = asset.get('walletBalance')
+                try:
+                    if bal not in (None, ''): usdt_balance = float(bal)
+                    elif w_bal not in (None, ''): usdt_balance = float(w_bal)
+                except (TypeError, ValueError):
+                    pass
+                break
+
+        if usdt_balance <= 0:
+            update.message.reply_text("❌ Недостаточно USDT для открытия сделки")
+            logger.warning("📉 Баланс USDT <= 0")
+            return
+
+        amount_to_risk = usdt_balance * (RISK_PERCENT / 100)
+        logger.info(f"💰 Используем: {amount_to_risk:.2f} USDT из {usdt_balance:.2f}")
+
+        # Получаем цену
+        try:
+            ticker = client.futures_symbol_ticker(symbol=SYMBOL)
+            price = float(ticker['price'])
+        except Exception as e:
+            update.message.reply_text("❌ Ошибка получения цены BTCUSDT")
+            logger.error(f"❌ Ошибка цены: {e}")
+            return
+
+        logger.info(f"📈 Цена: {price:.2f}")
+
+        # Расчёт количества
+        qty = (amount_to_risk * LEVERAGE) / price
+
+        # Округление
+        try:
+            info = client.futures_exchange_info()
+            step_size = 0.001
+            for s in info['symbols']:
+                if s['symbol'] == SYMBOL:
+                    for f in s['filters']:
+                        if f['filterType'] == 'LOT_SIZE':
+                            step_size = float(f['stepSize'])
+                            break
+            qty = round((qty // step_size) * step_size, 6)
+        except Exception as e:
+            update.message.reply_text("❌ Ошибка расчёта объёма")
+            logger.error(f"❌ LOT_SIZE ошибка: {e}")
+            return
+
+        if qty <= 0:
+            update.message.reply_text("❌ Недостаточно средств.")
+            logger.warning("📉 Количество <= 0")
+            return
+
+        # Рыночный ордер
+        try:
+            client.futures_create_order(
+                symbol=SYMBOL,
+                side="BUY",
+                type="MARKET",
+                quantity=qty
+            )
+            update.message.reply_text(
+                f"✅ LONG открыт\n"
+                f"📊 {qty} {SYMBOL}\n"
+                f"💰 На сумму: ~{amount_to_risk:.2f} USDT\n"
+                f"⚙️ Плечо: x{LEVERAGE}\n"
+                f"📈 Цена: {price:.2f}"
+            )
+            logger.info(f"✅ LONG: {qty} по {price:.2f}")
+        except Exception as e:
+            error = str(e)
+            update.message.reply_text(f"❌ Ошибка ордера: {error[:80]}")
+            logger.error(f"🔴 Ошибка ордера: {error}")
+
+    except Exception as e:
+        error = str(e)
+        update.message.reply_text(f"❌ Ошибка BUY: {error[:100]}")
+        logger.error(f"🔴 Ошибка BUY: {error}")
+
+# === Закрытие позиции ===
+def close_position(update: Update):
+    try:
+        update.message.reply_text("🔄 Выполняю: CLOSE BTCUSDT")
+
+        # Получаем позиции
+        try:
+            positions = client.futures_position_information(symbol=SYMBOL)
+        except Exception as e:
+            update.message.reply_text("❌ Ошибка получения позиции")
+            logger.error(f"❌ futures_position_information ошибка: {e}")
+            return
+
+        position = None
+        for p in positions:
+            if float(p['positionAmt']) != 0:
+                position = p
+                break
+
+        if not position:
+            update.message.reply_text("ℹ️ Нет открытой позиции для закрытия.")
+            logger.info("ℹ️ Нет позиции")
+            return
+
+        qty = abs(float(position['positionAmt']))
+        side = "SELL"
+
+        try:
+            client.futures_create_order(
+                symbol=SYMBOL,
+                side=side,
+                type="MARKET",
+                quantity=qty
+            )
+            pnl = float(position['unRealizedProfit'])
+            update.message.reply_text(
+                f"✅ Позиция закрыта\n"
+                f"CloseOperation: {side} {qty} {SYMBOL}\n"
+                f"💡 PnL: {pnl:.3f} USDT"
+            )
+            logger.info(f"✅ Позиция закрыта. PnL: {pnl:.3f}")
+        except Exception as e:
+            error = str(e)
+            update.message.reply_text(f"❌ Ошибка закрытия: {error[:80]}")
+            logger.error(f"🔴 Ошибка закрытия: {error}")
+
+    except Exception as e:
+        error = str(e)
+        update.message.reply_text(f"❌ Ошибка CLOSE: {error[:100]}")
+        logger.error(f"🔴 Ошибка CLOSE: {error}")
+
+# === Запуск бота ===
+def main():
+    try:
+        updater = Updater(TELEGRAM_TOKEN, use_context=True)
+        updater.dispatcher.add_handler(MessageHandler(Filters.text, handle_message))
+        logger.info("✅ Бот запущен. Ожидание сигналов: BUY / CLOSE")
+        print("💡 Бот работает. Проверь bot.log для деталей.")
+        updater.start_polling(drop_pending_updates=True)
+        updater.idle()
+    except Exception as e:
+        logger.critical(f"💀 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        print("❌ Бот упал. Смотри bot.log")
+
+if __name__ == '__main__':
+    main()
